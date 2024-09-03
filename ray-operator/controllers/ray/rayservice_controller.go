@@ -183,7 +183,7 @@ func (r *RayServiceReconciler) Reconcile(ctx context.Context, request ctrl.Reque
 	}
 
 	if !isReady {
-		logger.Info(fmt.Sprintf("Ray Serve applications are not ready to serve requests: checking again in %ss", ServiceDefaultRequeueDuration))
+		logger.Info("Ray Serve applications are not ready to serve requests", "requeue_duration", ServiceDefaultRequeueDuration.String())
 		r.Recorder.Eventf(rayServiceInstance, "Normal", "ServiceNotReady", "The service is not ready yet. Controller will perform a round of actions in %s.", ServiceDefaultRequeueDuration)
 		return ctrl.Result{RequeueAfter: ServiceDefaultRequeueDuration}, nil
 	}
@@ -989,9 +989,7 @@ func (r *RayServiceReconciler) reconcileServices(ctx context.Context, rayService
 		// ClusterIP is immutable. Starting from Kubernetes v1.21.5, if the new service does not specify a ClusterIP,
 		// Kubernetes will assign the ClusterIP of the old service to the new one. However, to maintain compatibility
 		// with older versions of Kubernetes, we need to assign the ClusterIP here.
-		if newSvc.Spec.ClusterIP == "" {
-			newSvc.Spec.ClusterIP = oldSvc.Spec.ClusterIP
-		}
+		newSvc.Spec.ClusterIP = oldSvc.Spec.ClusterIP
 
 		// TODO (kevin85421): Consider not only the updates of the Spec but also the ObjectMeta.
 		oldSvc.Spec = *newSvc.Spec.DeepCopy()
