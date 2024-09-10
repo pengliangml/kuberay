@@ -4,6 +4,7 @@ import (
 	"context"
 	errstd "errors"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"runtime"
@@ -15,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
+	configapi "github.com/ray-project/kuberay/ray-operator/apis/config/v1alpha1"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/batchscheduler"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/common"
 	"github.com/ray-project/kuberay/ray-operator/controllers/ray/utils"
@@ -51,7 +53,6 @@ type reconcileFunc func(context.Context, *rayv1.RayCluster) error
 
 var (
 	DefaultRequeueDuration = 2 * time.Second
-	EnableBatchScheduler   bool
 
 	// Definition of a index field for pod name
 	podUIDIndexField = "metadata.uid"
@@ -97,7 +98,7 @@ func getClusterType(ctx context.Context) bool {
 }
 
 // NewReconciler returns a new reconcile.Reconciler
-func NewReconciler(ctx context.Context, mgr manager.Manager, options RayClusterReconcilerOptions) *RayClusterReconciler {
+func NewReconciler(ctx context.Context, mgr manager.Manager, options RayClusterReconcilerOptions, rayConfigs configapi.Configuration) *RayClusterReconciler {
 	if err := mgr.GetFieldIndexer().IndexField(ctx, &corev1.Pod{}, podUIDIndexField, func(rawObj client.Object) []string {
 		pod := rawObj.(*corev1.Pod)
 		return []string{string(pod.UID)}
@@ -106,11 +107,22 @@ func NewReconciler(ctx context.Context, mgr manager.Manager, options RayClusterR
 	}
 	isOpenShift := getClusterType(ctx)
 
+	// init the batch scheduler manager
+	schedulerMgr, err := batchscheduler.NewSchedulerManager(rayConfigs, mgr.GetConfig())
+	if err != nil {
+		// fail fast if the scheduler plugin fails to init
+		// prevent running the controller in an undefined state
+		panic(err)
+	}
+
+	// add schema to runtime
+	schedulerMgr.AddToScheme(mgr.GetScheme())
+
 	return &RayClusterReconciler{
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
 		Recorder:          mgr.GetEventRecorderFor("raycluster-controller"),
-		BatchSchedulerMgr: batchscheduler.NewSchedulerManager(mgr.GetConfig()),
+		BatchSchedulerMgr: schedulerMgr,
 		IsOpenShift:       isOpenShift,
 
 		headSidecarContainers:   options.HeadSidecarContainers,
@@ -364,10 +376,11 @@ func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, request 
 // this field should be used to determine whether to update this CR or not.
 func (r *RayClusterReconciler) inconsistentRayClusterStatus(ctx context.Context, oldStatus rayv1.RayClusterStatus, newStatus rayv1.RayClusterStatus) bool {
 	logger := ctrl.LoggerFrom(ctx)
-	if oldStatus.State != newStatus.State || oldStatus.Reason != newStatus.Reason {
+
+	if oldStatus.State != newStatus.State || oldStatus.Reason != newStatus.Reason { //nolint:staticcheck // https://github.com/ray-project/kuberay/pull/2288
 		logger.Info("inconsistentRayClusterStatus", "detect inconsistency", fmt.Sprintf(
 			"old State: %s, new State: %s, old Reason: %s, new Reason: %s",
-			oldStatus.State, newStatus.State, oldStatus.Reason, newStatus.Reason))
+			oldStatus.State, newStatus.State, oldStatus.Reason, newStatus.Reason)) //nolint:staticcheck // https://github.com/ray-project/kuberay/pull/2288
 		return true
 	}
 	if oldStatus.ReadyWorkerReplicas != newStatus.ReadyWorkerReplicas ||
@@ -424,12 +437,12 @@ func (r *RayClusterReconciler) reconcileRouteOpenShift(ctx context.Context, inst
 		return err
 	}
 
-	if headRoutes.Items != nil && len(headRoutes.Items) == 1 {
+	if len(headRoutes.Items) == 1 {
 		logger.Info("reconcileIngresses", "head service route found", headRoutes.Items[0].Name)
 		return nil
 	}
 
-	if headRoutes.Items == nil || len(headRoutes.Items) == 0 {
+	if len(headRoutes.Items) == 0 {
 		route, err := common.BuildRouteForHeadService(*instance)
 		if err != nil {
 			return err
@@ -456,12 +469,12 @@ func (r *RayClusterReconciler) reconcileIngressKubernetes(ctx context.Context, i
 		return err
 	}
 
-	if headIngresses.Items != nil && len(headIngresses.Items) == 1 {
+	if len(headIngresses.Items) == 1 {
 		logger.Info("reconcileIngresses", "head service ingress found", headIngresses.Items[0].Name)
 		return nil
 	}
 
-	if headIngresses.Items == nil || len(headIngresses.Items) == 0 {
+	if len(headIngresses.Items) == 0 {
 		ingress, err := common.BuildIngressForHeadService(ctx, *instance)
 		if err != nil {
 			return err
@@ -621,7 +634,9 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 	if err := r.List(ctx, &headPods, common.RayClusterHeadPodsAssociationOptions(instance).ToListOptions()...); err != nil {
 		return err
 	}
-	if EnableBatchScheduler {
+	// check if the batch scheduler integration is enabled
+	// call the scheduler plugin if so
+	if r.BatchSchedulerMgr != nil {
 		if scheduler, err := r.BatchSchedulerMgr.GetSchedulerForCluster(instance); err == nil {
 			if err := scheduler.DoBatchSchedulingOnSubmission(ctx, instance); err != nil {
 				return err
@@ -651,7 +666,7 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 			r.Recorder.Eventf(instance, corev1.EventTypeNormal, string(utils.DeletedHeadPod),
 				"Deleted head Pod %s/%s; Pod status: %s; Pod restart policy: %s; Ray container terminated status: %v",
 				headPod.Namespace, headPod.Name, headPod.Status.Phase, headPod.Spec.RestartPolicy, getRayContainerStateTerminated(headPod))
-			return fmt.Errorf(reason)
+			return errstd.New(reason)
 		}
 	} else if len(headPods.Items) == 0 {
 		// Create head Pod if it does not exist.
@@ -755,7 +770,11 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 			worker.NumOfHosts = 1
 		}
 		numExpectedPods := workerReplicas * worker.NumOfHosts
-		diff := numExpectedPods - int32(len(runningPods.Items))
+
+		if len(runningPods.Items) > math.MaxInt32 {
+			return errstd.New("len(runningPods.Items) exceeds math.MaxInt32")
+		}
+		diff := numExpectedPods - int32(len(runningPods.Items)) //nolint:gosec // Already checked in the previous line.
 
 		logger.Info("reconcilePods", "workerReplicas", workerReplicas, "NumOfHosts", worker.NumOfHosts, "runningPods", len(runningPods.Items), "diff", diff)
 
@@ -956,7 +975,9 @@ func (r *RayClusterReconciler) createHeadPod(ctx context.Context, instance rayv1
 
 	// build the pod then create it
 	pod := r.buildHeadPod(ctx, instance)
-	if EnableBatchScheduler {
+	// check if the batch scheduler integration is enabled
+	// call the scheduler plugin if so
+	if r.BatchSchedulerMgr != nil {
 		if scheduler, err := r.BatchSchedulerMgr.GetSchedulerForCluster(&instance); err == nil {
 			scheduler.AddMetadataToPod(&instance, utils.RayNodeHeadGroupLabelValue, &pod)
 		} else {
@@ -978,7 +999,7 @@ func (r *RayClusterReconciler) createWorkerPod(ctx context.Context, instance ray
 
 	// build the pod then create it
 	pod := r.buildWorkerPod(ctx, instance, worker)
-	if EnableBatchScheduler {
+	if r.BatchSchedulerMgr != nil {
 		if scheduler, err := r.BatchSchedulerMgr.GetSchedulerForCluster(&instance); err == nil {
 			scheduler.AddMetadataToPod(&instance, worker.GroupName, &pod)
 		} else {
@@ -1133,8 +1154,8 @@ func (r *RayClusterReconciler) SetupWithManager(mgr ctrl.Manager, reconcileConcu
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.Service{})
 
-	if EnableBatchScheduler {
-		b = batchscheduler.ConfigureReconciler(b)
+	if r.BatchSchedulerMgr != nil {
+		r.BatchSchedulerMgr.ConfigureReconciler(b)
 	}
 
 	return b.
@@ -1199,7 +1220,7 @@ func (r *RayClusterReconciler) calculateStatus(ctx context.Context, instance *ra
 	newInstance.Status.DesiredTPU = totalResources[corev1.ResourceName("google.com/tpu")]
 
 	if utils.CheckAllPodsRunning(ctx, runtimePods) {
-		newInstance.Status.State = rayv1.Ready
+		newInstance.Status.State = rayv1.Ready //nolint:staticcheck // https://github.com/ray-project/kuberay/pull/2288
 	}
 
 	// Check if the head node is running and ready by checking the head pod's status.
@@ -1244,7 +1265,7 @@ func (r *RayClusterReconciler) calculateStatus(ctx context.Context, instance *ra
 	}
 
 	if newInstance.Spec.Suspend != nil && *newInstance.Spec.Suspend && len(runtimePods.Items) == 0 {
-		newInstance.Status.State = rayv1.Suspended
+		newInstance.Status.State = rayv1.Suspended //nolint:staticcheck // https://github.com/ray-project/kuberay/pull/2288
 	}
 
 	if err := r.updateEndpoints(ctx, newInstance); err != nil {
@@ -1258,11 +1279,11 @@ func (r *RayClusterReconciler) calculateStatus(ctx context.Context, instance *ra
 	timeNow := metav1.Now()
 	newInstance.Status.LastUpdateTime = &timeNow
 
-	if instance.Status.State != newInstance.Status.State {
+	if instance.Status.State != newInstance.Status.State { //nolint:staticcheck // https://github.com/ray-project/kuberay/pull/2288
 		if newInstance.Status.StateTransitionTimes == nil {
 			newInstance.Status.StateTransitionTimes = make(map[rayv1.ClusterState]*metav1.Time)
 		}
-		newInstance.Status.StateTransitionTimes[newInstance.Status.State] = &timeNow
+		newInstance.Status.StateTransitionTimes[newInstance.Status.State] = &timeNow //nolint:staticcheck // https://github.com/ray-project/kuberay/pull/2288
 	}
 
 	return newInstance, nil
@@ -1374,10 +1395,13 @@ func (r *RayClusterReconciler) reconcileAutoscalerServiceAccount(ctx context.Con
 		// zero-downtime rolling updates when RayService is performed. See https://github.com/ray-project/kuberay/issues/1123
 		// for more details.
 		if instance.Spec.HeadGroupSpec.Template.Spec.ServiceAccountName == namespacedName.Name {
-			logger.Error(err, fmt.Sprintf(
-				"If users specify ServiceAccountName for the head Pod, they need to create a ServiceAccount themselves. "+
-					"However, ServiceAccount %s is not found. Please create one. "+
-					"See the PR description of https://github.com/ray-project/kuberay/pull/1128 for more details.", namespacedName.Name), "ServiceAccount", namespacedName)
+			actionableMessage := fmt.Sprintf("If users specify ServiceAccountName for the head Pod, they need to create a ServiceAccount themselves. "+
+				"However, ServiceAccount %s is not found. Please create one. See the PR description of https://github.com/ray-project/kuberay/pull/1128 for more details.", namespacedName.Name)
+
+			logger.Error(
+				err,
+				actionableMessage)
+			r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.AutoscalerServiceAccountNotFound), "Failed to reconcile RayCluster %s/%s. %s", instance.Namespace, instance.Name, actionableMessage)
 			return err
 		}
 
