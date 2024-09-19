@@ -129,6 +129,11 @@ func (r *RayJobReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
 	}
 
+	if err := validateRayJobStatus(rayJobInstance); err != nil {
+		logger.Error(err, "The RayJob status is invalid")
+		return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
+	}
+
 	// Please do NOT modify `originalRayJobInstance` in the following code.
 	originalRayJobInstance := rayJobInstance.DeepCopy()
 
@@ -177,14 +182,29 @@ func (r *RayJobReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 			rayJobInstance.Status.DashboardURL = clientURL
 		}
 
+		if rayJobInstance.Spec.SubmissionMode == rayv1.UserMode {
+			logger.Info("SubmissionMode is UserMode and the RayCluster is created. Transition the status from `Initializing` to `Waiting`.")
+			rayJobInstance.Status.JobDeploymentStatus = rayv1.JobDeploymentStatusWaiting
+			break
+		}
+
 		if rayJobInstance.Spec.SubmissionMode == rayv1.K8sJobMode {
 			if err := r.createK8sJobIfNeed(ctx, rayJobInstance, rayClusterInstance); err != nil {
 				return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, err
 			}
 		}
 
-		logger.Info("Both RayCluster and the submitter K8s Job are created. Transition the status from `Initializing` to `Running`.",
+		logger.Info("Both RayCluster and the submitter K8s Job are created. Transition the status from `Initializing` to `Running`.", "SubmissionMode", rayJobInstance.Spec.SubmissionMode,
 			"RayJob", rayJobInstance.Name, "RayCluster", rayJobInstance.Status.RayClusterName)
+		rayJobInstance.Status.JobDeploymentStatus = rayv1.JobDeploymentStatusRunning
+	case rayv1.JobDeploymentStatusWaiting:
+		// Try to get the Ray job id from the Ray job annotations.
+		rayJobId, found := rayJobInstance.ObjectMeta.Annotations[utils.RayJobSubmissionIdLabelKey]
+		logger.Info("Get Ray job id from the Ray job annotations", "RayJobId", rayJobId, "Found", found)
+		if !found {
+			return ctrl.Result{RequeueAfter: RayJobDefaultRequeueDuration}, nil
+		}
+		rayJobInstance.Status.JobId = rayJobId
 		rayJobInstance.Status.JobDeploymentStatus = rayv1.JobDeploymentStatusRunning
 	case rayv1.JobDeploymentStatusRunning:
 		if shouldUpdate := r.updateStatusToSuspendingIfNeeded(ctx, rayJobInstance); shouldUpdate {
@@ -508,10 +528,12 @@ func (r *RayJobReconciler) createNewK8sJob(ctx context.Context, rayJobInstance *
 
 	// Create the Kubernetes Job
 	if err := r.Client.Create(ctx, job); err != nil {
+		logger.Error(err, "Failed to create new Kubernetes Job")
+		r.Recorder.Eventf(rayJobInstance, corev1.EventTypeWarning, "k8sJobCreationFailed", "Failed to create new Kubernetes Job %s: %v", job.Name, err)
 		return err
 	}
 	logger.Info("Kubernetes Job created", "RayJob", rayJobInstance.Name, "Kubernetes Job", job.Name)
-	r.Recorder.Eventf(rayJobInstance, corev1.EventTypeNormal, "Created", "Created Kubernetes Job %s", job.Name)
+	r.Recorder.Eventf(rayJobInstance, corev1.EventTypeNormal, "k8sJobCreationCreated", "Created Kubernetes Job %s", job.Name)
 	return nil
 }
 
@@ -606,6 +628,7 @@ func (r *RayJobReconciler) SetupWithManager(mgr ctrl.Manager, reconcileConcurren
 // This function is the sole place where `JobDeploymentStatusInitializing` is defined. It initializes `Status.JobId` and `Status.RayClusterName`
 // prior to job submissions and RayCluster creations. This is used to avoid duplicate job submissions and cluster creations. In addition, this
 // function also sets `Status.StartTime` to support `ActiveDeadlineSeconds`.
+// This function will set or generate JobId if SubmissionMode is not UserMode.
 func (r *RayJobReconciler) initRayJobStatusIfNeed(ctx context.Context, rayJob *rayv1.RayJob) error {
 	logger := ctrl.LoggerFrom(ctx)
 	shouldUpdateStatus := rayJob.Status.JobId == "" || rayJob.Status.RayClusterName == "" || rayJob.Status.JobStatus == ""
@@ -615,7 +638,7 @@ func (r *RayJobReconciler) initRayJobStatusIfNeed(ctx context.Context, rayJob *r
 		return nil
 	}
 
-	if rayJob.Status.JobId == "" {
+	if rayJob.Spec.SubmissionMode != rayv1.UserMode && rayJob.Status.JobId == "" {
 		if rayJob.Spec.JobId != "" {
 			rayJob.Status.JobId = rayJob.Spec.JobId
 		} else {
@@ -809,5 +832,13 @@ func validateRayJobSpec(rayJob *rayv1.RayJob) error {
 	if rayJob.Spec.BackoffLimit != nil && *rayJob.Spec.BackoffLimit < 0 {
 		return fmt.Errorf("backoffLimit must be a positive integer")
 	}
+	return nil
+}
+
+func validateRayJobStatus(rayJob *rayv1.RayJob) error {
+	if rayJob.Status.JobDeploymentStatus == rayv1.JobDeploymentStatusWaiting && rayJob.Spec.SubmissionMode != rayv1.UserMode {
+		return fmt.Errorf("invalid RayJob State: JobDeploymentStatus cannot be `Waiting` when SubmissionMode is not UserMode")
+	}
+
 	return nil
 }

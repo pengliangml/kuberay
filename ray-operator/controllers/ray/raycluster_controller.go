@@ -4,7 +4,6 @@ import (
 	"context"
 	errstd "errors"
 	"fmt"
-	"math"
 	"os"
 	"reflect"
 	"runtime"
@@ -303,9 +302,13 @@ func (r *RayClusterReconciler) rayClusterReconcile(ctx context.Context, request 
 					logger.Info("Redis cleanup Job already exists. Requeue the RayCluster CR.")
 					return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
 				}
+				r.Recorder.Eventf(instance, corev1.EventTypeWarning, string(utils.FailedToCreateRedisCleanupJob),
+					"Failed to create Redis cleanup Job %s/%s, %v", redisCleanupJob.Namespace, redisCleanupJob.Name, err)
 				return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, err
 			}
 			logger.Info("Created Redis cleanup Job", "name", redisCleanupJob.Name)
+			r.Recorder.Eventf(instance, corev1.EventTypeNormal, string(utils.CreatedRedisCleanupJob),
+				"Created Redis cleanup Job %s/%s", redisCleanupJob.Namespace, redisCleanupJob.Name)
 			return ctrl.Result{RequeueAfter: DefaultRequeueDuration}, nil
 		}
 	}
@@ -598,10 +601,7 @@ func (r *RayClusterReconciler) reconcileHeadlessService(ctx context.Context, ins
 			return nil
 		}
 		// Create headless tpu worker service if there's no existing one in the cluster.
-		headlessSvc, err := common.BuildHeadlessServiceForRayCluster(*instance)
-		if err != nil {
-			return err
-		}
+		headlessSvc := common.BuildHeadlessServiceForRayCluster(*instance)
 
 		if err := r.createService(ctx, headlessSvc, instance); err != nil {
 			return err
@@ -769,12 +769,8 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 		if worker.NumOfHosts <= 0 {
 			worker.NumOfHosts = 1
 		}
-		numExpectedPods := workerReplicas * worker.NumOfHosts
-
-		if len(runningPods.Items) > math.MaxInt32 {
-			return errstd.New("len(runningPods.Items) exceeds math.MaxInt32")
-		}
-		diff := numExpectedPods - int32(len(runningPods.Items)) //nolint:gosec // Already checked in the previous line.
+		numExpectedPods := int(workerReplicas * worker.NumOfHosts)
+		diff := numExpectedPods - len(runningPods.Items)
 
 		logger.Info("reconcilePods", "workerReplicas", workerReplicas, "NumOfHosts", worker.NumOfHosts, "runningPods", len(runningPods.Items), "diff", diff)
 
@@ -782,8 +778,7 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 			// pods need to be added
 			logger.Info("reconcilePods", "Number workers to add", diff, "Worker group", worker.GroupName)
 			// create all workers of this group
-			var i int32
-			for i = 0; i < diff; i++ {
+			for i := 0; i < diff; i++ {
 				logger.Info("reconcilePods", "creating worker for group", worker.GroupName, fmt.Sprintf("index %d", i), fmt.Sprintf("in total %d", diff))
 				if err := r.createWorkerPod(ctx, *instance, *worker.DeepCopy()); err != nil {
 					return errstd.Join(utils.ErrFailedCreateWorkerPod, err)
@@ -814,7 +809,7 @@ func (r *RayClusterReconciler) reconcilePods(ctx context.Context, instance *rayv
 				// diff < 0 means that we need to delete some Pods to meet the desired number of replicas.
 				randomlyRemovedWorkers := -diff
 				logger.Info("reconcilePods", "Number workers to delete randomly", randomlyRemovedWorkers, "Worker group", worker.GroupName)
-				for i := 0; i < int(randomlyRemovedWorkers); i++ {
+				for i := 0; i < randomlyRemovedWorkers; i++ {
 					randomPodToDelete := runningPods.Items[i]
 					logger.Info("Randomly deleting Pod", "progress", fmt.Sprintf("%d / %d", i+1, randomlyRemovedWorkers), "with name", randomPodToDelete.Name)
 					if err := r.Delete(ctx, &randomPodToDelete); err != nil {
